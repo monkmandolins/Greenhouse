@@ -1,0 +1,120 @@
+Thank you for sharing the Amazon link to your ESP32-2432S028 development board. This board, often referred to as the "Cheap Yellow Display" (CYD), integrates a 2.8" TFT touchscreen and is based on the ESP32-WROOM-32 module. While it offers several GPIO pins for peripheral connections, some are pre-assigned to onboard components, which can limit their availability for custom applications.
+GitHub
++3
+Art of Circuits
++3
+Random Nerd Tutorials
++3
+
+🔌 Available GPIO Pins for Your Greenhouse Project
+For your greenhouse setup—reading data from a DHT22 sensor and controlling relays for LED lights, a mister, a humidifier, and a heater/fan—you'll need at least five GPIO pins: one for the DHT22 and four for the relays. Here's a breakdown of the GPIO pins available on your board:
+
+1. GPIO 27
+Location: CN1 connector
+
+Functionality: General-purpose I/O
+
+Availability: Free for use
+Scribd
++5
+Random Nerd Tutorials
++5
+macsbug
++5
+GitHub
+
+2. GPIO 22
+Location: Available on both P3 and CN1 connectors
+
+Functionality: General-purpose I/O
+
+Availability: Free for use
+GitHub
++3
+Random Nerd Tutorials
++3
+Home Assistant Community
++3
+Home Assistant Community
++1
+Random Nerd Tutorials
++1
+
+3. GPIO 35
+Location: P3 connector
+
+Functionality: Input-only GPIO
+
+Availability: Suitable for sensors like the DHT22
+Scribd
+
+4. GPIO 21
+Location: P3 connector
+
+Functionality: Connected to the TFT display backlight
+
+Availability: Not recommended for use, as it's tied to the display's backlight control. 
+macsbug
++2
+Amazon Media
++2
+Wikipedia
++2
+Random Nerd Tutorials
++10
+Random Nerd Tutorials
++10
+Wikipedia
++10
+Art of Circuits
+
+5. GPIO 16 and GPIO 17
+Functionality: Connected to the onboard RGB LED
+
+Availability: Usable if the RGB LED is not required for your application. 
+ESP Boards
++4
+Random Nerd Tutorials
++4
+Random Nerd Tutorials
++4
+CircuitPython
++2
+GitHub
++2
+Random Nerd Tutorials
++2
+
+🛠️ Recommended GPIO Assignments
+Based on the above, here's a suggested mapping for your project:
+
+DHT22 Sensor (Input): GPIO 35
+
+Relay for LED Lights: GPIO 27
+
+Relay for Mister: GPIO 22
+
+Relay for Humidifier: GPIO 16
+
+Relay for Heater/Fan: GPIO 17
+GitHub
++9
+Home Assistant Community
++9
+GitHub
++9
+Art of Circuits
++6
+Random Nerd Tutorials
++6
+Wikipedia
++6
+
+Note: Ensure that GPIO 16 and GPIO 17 are not being used by the onboard RGB LED in your application. If they are, you'll need to reassign or disable the RGB LED functionality.
+
+⚠️ Important Considerations
+GPIO 21: As it's connected to the TFT display's backlight, using this pin for other purposes can interfere with the display's operation.
+
+GPIO 35: Being input-only, it's suitable for sensors but cannot be used to drive outputs like relays.
+
+Power Requirements: Ensure that the total current drawn by the relays does not exceed the board's power supply capabilities. Use external power sources and opto-isolated relay modules if necessary.
