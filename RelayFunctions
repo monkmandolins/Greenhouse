@@ -1,0 +1,34 @@
+PSEUDOCODE
+
+#include "DHT.h"
+#define DHTPIN 14
+#define DHTTYPE DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+#define RELAY_LED 16
+#define RELAY_MISTER 17
+#define RELAY_HUMIDIFIER 18
+#define RELAY_HEATER 19
+
+void setup() {
+  Serial.begin(115200);
+  dht.begin();
+  pinMode(RELAY_LED, OUTPUT);
+  pinMode(RELAY_MISTER, OUTPUT);
+  pinMode(RELAY_HUMIDIFIER, OUTPUT);
+  pinMode(RELAY_HEATER, OUTPUT);
+}
+
+void loop() {
+  float temp = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  // Example logic
+  if (humidity < 40.0) {
+    digitalWrite(RELAY_HUMIDIFIER, LOW); // Turn ON
+  } else {
+    digitalWrite(RELAY_HUMIDIFIER, HIGH); // Turn OFF
+  }
+
+  delay(2000);
+}
