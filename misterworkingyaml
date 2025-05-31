@@ -1,0 +1,54 @@
+##Fussy Buttons
+esphome:
+  name: mister
+  friendly_name: Mister
+  min_version: 2025.5.0
+  name_add_mac_suffix: false
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "6iRF/zZQQM5T0r9L/XS49y8qhnd/SJYyTFAxaMBa1oc=" # Your API encryption key
+
+ota:
+  - platform: esphome
+    password: "20839ccfa8c52c956f74be32393fbd2b" # Your OTA password
+
+wifi:
+  ssid: "yourwifi"
+  password: "yourpassword" # Your Wi-Fi password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Mister Fallback Hotspot"
+    password: "yDXx5R5FVQlB"
+
+captive_portal:
+
+output:
+  - platform: gpio
+    pin: GPIO1
+    id: mister_trigger
+    inverted: false
+
+switch:
+  - platform: template
+    name: "Mister Trigger"
+    icon: "mdi:spray"
+    turn_on_action:
+      - output.turn_on: mister_trigger
+      - delay: 1000ms
+      - output.turn_off: mister_trigger
+
+
+
+
+      
