@@ -1,0 +1,168 @@
+# Minimal configuration for ESP32 CYD
+esphome:
+  name: smart_greenhouse
+  platform: ESP32
+  board: esp32-cyd
+
+wifi:
+  ssid: "YOUR_WIFI_SSID"
+  password: "YOUR_WIFI_PASSWORD"
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+
+ota:
+
+
+
+i2c:
+  id: i2c_bus
+  sda: GPIO8
+  scl: GPIO9
+  frequency: 100kHz
+
+globals:
+  - id: rp2040_slave_address
+    type: uint8_t
+    restore_value: no
+    initial_value: '0x42'
+
+# ----------------------------
+# Sensors: Temperature & Humidity
+# ----------------------------
+
+sensor:
+  - platform: template
+    name: "Outside Temperature"
+    id: outside_temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+
+  - platform: template
+    name: "Outside Humidity"
+    id: outside_humidity
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+
+  - platform: template
+    name: "Inside Temperature"
+    id: inside_temperature
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+
+  - platform: template
+    name: "Inside Humidity"
+    id: inside_humidity
+    unit_of_measurement: "%"
+    device_class: humidity
+    state_class: measurement
+
+# ----------------------------
+# Switches
+# ----------------------------
+
+switch:
+  - platform: template
+    name: "Grow Lights"
+    id: led_grow_lights
+    optimistic: true
+    on_turn_on:
+      then:
+        - lambda: 'id(control_sync)->write_controls();'
+    on_turn_off:
+      then:
+        - lambda: 'id(control_sync)->write_controls();'
+
+  - platform: template
+    name: "Mist Humidifier"
+    id: mist_humidity
+    optimistic: true
+    on_turn_on:
+      then:
+        - lambda: 'id(control_sync)->write_controls();'
+    on_turn_off:
+      then:
+        - lambda: 'id(control_sync)->write_controls();'
+
+# ----------------------------
+# Numbers (Fan, Heater)
+# ----------------------------
+
+number:
+  - platform: template
+    name: "Fan Speed"
+    id: fan_speed
+    icon: "mdi:fan"
+    min_value: 0
+    max_value: 255
+    step: 1
+    optimistic: true
+    set_action:
+      then:
+        - lambda: 'id(control_sync)->write_controls();'
+
+  - platform: template
+    name: "Heater Duty Cycle"
+    id: heater_temperature
+    icon: "mdi:radiator"
+    min_value: 0
+    max_value: 255
+    step: 1
+    optimistic: true
+    set_action:
+      then:
+        - lambda: 'id(control_sync)->write_controls();'
+
+# ----------------------------
+# Custom Component for I2C Read/Write
+# ----------------------------
+
+custom_component:
+  - id: control_sync
+    lambda: |-
+      class RP2040Bridge : public PollingComponent {
+       public:
+        RP2040Bridge() : PollingComponent(10000) {}
+
+        void setup() override {
+          // nothing to init
+        }
+
+        void update() override {
+          uint8_t data[16];
+          if (i2c_bus->read_bytes(id(rp2040_slave_address), data, 16)) {
+            float temp_out, hum_out, temp_in, hum_in;
+            memcpy(&temp_out, &data[0], 4);
+            memcpy(&hum_out, &data[4], 4);
+            memcpy(&temp_in, &data[8], 4);
+            memcpy(&hum_in, &data[12], 4);
+
+            id(outside_temperature).publish_state(temp_out);
+            id(outside_humidity).publish_state(hum_out);
+            id(inside_temperature).publish_state(temp_in);
+            id(inside_humidity).publish_state(hum_in);
+          } else {
+            ESP_LOGW("rp2040", "I2C read failed");
+          }
+        }
+
+        void write_controls() {
+          uint8_t data[4];
+          data[0] = id(led_grow_lights).state ? 1 : 0;
+          data[1] = id(mist_humidity).state ? 1 : 0;
+          data[2] = static_cast<uint8_t>(id(fan_speed).state);
+          data[3] = static_cast<uint8_t>(id(heater_temperature).state);
+
+          if (!i2c_bus->write_bytes(id(rp2040_slave_address), data, 4)) {
+            ESP_LOGE("rp2040", "I2C write failed");
+          }
+        }
+      };
+
+      return {new RP2040Bridge()};
