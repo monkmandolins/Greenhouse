@@ -1,0 +1,230 @@
+/*
+This is for the slave device on the Greenhouse board.
+The master is ESP32Home, likely on a CYD.
+
+Pin Designations (RP2040 GPIO Pins):
+12V Heater PWM Control = GP1
+12V Fan PWM Control = GP14
+LED Grow Lights Digital Output = GP7
+Atomizer Digital Output = GP8
+DHT22 in the room = GP5
+DHT22 in the greenhouse = GP6
+I2C SDA = GP2
+I2C SCL = GP3
+
+Setup Instructions:
+1.  Install the Raspberry Pi Pico/RP2040 board package in your Arduino IDE.
+    Go to Tools > Board > Boards Manager..., search for "Pico" or "RP2040",
+    and install the "Raspberry Pi Pico/RP2040 by Earle F. Philhower".
+2.  Select your specific RP2040 board under Tools > Board.
+
+Libraries Needed:
+1.  Adafruit Unified Sensor: Install via Arduino IDE Library Manager.
+2.  DHT sensor library: Install via Arduino IDE Library Manager (from Adafruit).
+3.  Wire library: This is a built-in Arduino library for I2C communication.
+*/
+
+#include <Wire.h> // For I2C communication (Wire1 for custom pins)
+#include <DHT.h>
+#include <DHT_U.h> // Required for Adafruit DHT library
+
+// --- I2C Slave Configuration ---
+#define I2C_SLAVE_ADDRESS 0x42 // Must match ESPHome master address
+
+// --- Pin Definitions (Adjusted to your specified wiring) ---
+// DHT22 Sensors
+#define DHT_OUTSIDE_PIN 5 // GP5 for DHT22 in the room
+#define DHT_INSIDE_PIN 6  // GP6 for DHT22 in the greenhouse
+
+#define DHTTYPE DHT22 // DHT 22 (AM2302)
+
+// Outputs
+#define LED_GROW_LIGHTS_PIN 7 // GP7 for LED Grow Lights Digital Output
+#define MIST_HUMIDITY_PIN 8   // GP8 for Atomizer Digital Output (Mist Humidity)
+#define FAN_SPEED_PIN 14      // GP14 for 12V Fan PWM Control
+#define HEATER_TEMPERATURE_PIN 1 // GP1 for 12V Heater PWM Control
+
+// I2C Custom Pins
+#define I2C_SDA_PIN 2 // GP2 for I2C SDA
+#define I2C_SCL_PIN 3 // GP3 for I2C SCL
+
+
+// --- DHT Sensor Objects ---
+DHT_Unified dhtOutside(DHT_OUTSIDE_PIN, DHTTYPE);
+DHT_Unified dhtInside(DHT_INSIDE_PIN, DHTTYPE);
+
+// --- Current Sensor Readings (Volatile for shared access with I2C ISR) ---
+volatile float outsideTemp_C = 0.0;
+volatile float outsideHum = 0.0;
+volatile float insideTemp_C = 0.0;
+volatile float insideHum = 0.0;
+
+// --- Output States ---
+volatile bool ledGrowLightsState = false;
+volatile bool mistHumidityState = false;
+volatile uint8_t fanSpeedDuty = 0;    // 0-255 (from master)
+volatile uint8_t heaterDuty = 0;      // 0-255 (from master)
+
+// PWM Frequency (adjust if needed, 1kHz is a good start)
+const int PWM_FREQ = 1000;
+const int PWM_BITS = 16; // 16-bit resolution for RP2040 PWM (0-65535)
+
+// --- Function Prototypes ---
+void requestEvent();
+void receiveEvent(int howMany);
+void readDHTSensors();
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial); // Wait for Serial Monitor to open
+
+  Serial.println("RP2040 I2C Slave with DHT22 Sensors");
+
+  // --- Initialize I2C Slave on custom pins GP2 (SDA) and GP3 (SCL) ---
+  // Using Wire1 to specify custom I2C pins, as Wire (Wire0) defaults to GP4/GP5.
+  Wire1.setSDA(I2C_SDA_PIN);
+  Wire1.setSCL(I2C_SCL_PIN);
+  Wire1.begin(I2C_SLAVE_ADDRESS);
+  Wire1.onRequest(requestEvent);    // Register request event handler
+  Wire1.onReceive(receiveEvent);    // Register receive event handler
+
+  Serial.print("I2C Slave Address: 0x");
+  Serial.println(I2C_SLAVE_ADDRESS, HEX);
+  Serial.print("I2C SDA Pin: GP"); Serial.println(I2C_SDA_PIN);
+  Serial.print("I2C SCL Pin: GP"); Serial.println(I2C_SCL_PIN);
+
+  // --- Initialize DHT Sensors ---
+  dhtOutside.begin();
+  dhtInside.begin();
+  Serial.println("DHT22 sensors initialized.");
+
+  // Print sensor details to confirm
+  sensor_t sensor;
+  dhtOutside.info(&sensor);
+  Serial.print("Outside Sensor Type: "); Serial.println(sensor.name);
+  dhtInside.info(&sensor);
+  Serial.print("Inside Sensor Type: "); Serial.println(sensor.name);
+
+  // --- Initialize Output Pins ---
+  pinMode(LED_GROW_LIGHTS_PIN, OUTPUT);
+  pinMode(MIST_HUMIDITY_PIN, OUTPUT);
+
+  // Initialize PWM for Fan and Heater
+  // analogWriteResolution sets the range for subsequent analogWrite calls.
+  // RP2040 supports 16-bit PWM, so 0-65535 is the full range.
+  analogWriteResolution(PWM_BITS);
+  analogWrite(FAN_SPEED_PIN, 0); // Start with fan off (0 duty cycle)
+  analogWrite(HEATER_TEMPERATURE_PIN, 0); // Start with heater off (0 duty cycle)
+
+  // Set initial digital output states
+  digitalWrite(LED_GROW_LIGHTS_PIN, LOW);
+  digitalWrite(MIST_HUMIDITY_PIN, LOW);
+
+  // Perform an initial sensor reading
+  readDHTSensors();
+}
+
+void loop() {
+  // Periodically read DHT sensors
+  // This helps ensure the global volatile variables are updated regularly
+  // even if the master doesn't constantly request data.
+  readDHTSensors();
+
+  // You can add other non-blocking tasks here if needed.
+  delay(2000); // Read sensors every 2 seconds
+}
+
+// --- I2C Callbacks ---
+
+// Function to handle requests from master (ESP32)
+void requestEvent() {
+  // Master is requesting sensor data.
+  // Send 4 floats (temp_out, hum_out, temp_in, hum_in)
+  // Each float is 4 bytes, so total 16 bytes.
+  // Use a temporary buffer to ensure data is consistent during transmission.
+  float dataToSend[4];
+  dataToSend[0] = outsideTemp_C;
+  dataToSend[1] = outsideHum;
+  dataToSend[2] = insideTemp_C;
+  dataToSend[3] = insideHum;
+
+  // Write the float array directly to the I2C buffer.
+  // This sends 16 bytes.
+  Wire1.write((byte*)dataToSend, sizeof(dataToSend)); // Use Wire1 for custom pins
+
+  Serial.println("Sent sensor data to master.");
+}
+
+// Function to handle data received from master (ESP32)
+void receiveEvent(int howMany) {
+  if (howMany == 4) { // Expecting 4 bytes for control: LED, Mist, Fan, Heater
+    uint8_t receivedData[4];
+    for (int i = 0; i < howMany; i++) {
+      receivedData[i] = Wire1.read(); // Use Wire1 for custom pins
+    }
+
+    // Update global states based on received data
+    ledGrowLightsState = (receivedData[0] != 0); // 0 = OFF, 1 = ON
+    mistHumidityState = (receivedData[1] != 0);  // 0 = OFF, 1 = ON
+    fanSpeedDuty = receivedData[2];              // 0-255 (from ESPHome)
+    heaterDuty = receivedData[3];                // 0-255 (from ESPHome)
+
+    // Apply the new states to the pins
+    digitalWrite(LED_GROW_LIGHTS_PIN, ledGrowLightsState);
+    digitalWrite(MIST_HUMIDITY_PIN, mistHumidityState);
+
+    // Map 0-255 (from ESPHome master) to 0-65535 (16-bit PWM for RP2040)
+    uint16_t fanDuty16 = map(fanSpeedDuty, 0, 255, 0, 65535);
+    uint16_t heaterDuty16 = map(heaterDuty, 0, 255, 0, 65535);
+
+    analogWrite(FAN_SPEED_PIN, fanDuty16);
+    analogWrite(HEATER_TEMPERATURE_PIN, heaterDuty16);
+
+    Serial.print("Received commands: LED="); Serial.print(ledGrowLightsState);
+    Serial.print(", Mist="); Serial.print(mistHumidityState);
+    Serial.print(", Fan="); Serial.print(fanSpeedDuty);
+    Serial.print(", Heater="); Serial.println(heaterDuty);
+  } else {
+    // If unexpected data length, clear the buffer
+    while (Wire1.available()) { // Use Wire1 for custom pins
+      Wire1.read();
+    }
+    Serial.print("Received unexpected data length: ");
+    Serial.println(howMany);
+  }
+}
+
+// --- Sensor Reading Function ---
+void readDHTSensors() {
+  // Read outside sensor
+  sensors_event_t event;
+  dhtOutside.temperature().getEvent(&event);
+  if (isnan(event.temperature)) {
+    Serial.println("Error reading outside temperature!");
+  } else {
+    outsideTemp_C = event.temperature;
+  }
+  dhtOutside.humidity().getEvent(&event);
+  if (isnan(event.relative_humidity)) {
+    Serial.println("Error reading outside humidity!");
+  } else {
+    outsideHum = event.relative_humidity;
+  }
+
+  // Read inside sensor
+  dhtInside.temperature().getEvent(&event);
+  if (isnan(event.temperature)) {
+    Serial.println("Error reading inside temperature!");
+  } else {
+    insideTemp_C = event.temperature;
+  }
+  dhtInside.humidity().getEvent(&event);
+  if (isnan(event.relative_humidity)) {
+    Serial.println("Error reading inside humidity!");
+  } else {
+    insideHum = event.relative_humidity;
+  }
+
+  Serial.print("Outside: Temp="); Serial.print(outsideTemp_C); Serial.print("C, Hum="); Serial.print(outsideHum); Serial.println("%");
+  Serial.print("Inside: Temp="); Serial.print(insideTemp_C); Serial.print("C, Hum="); Serial.print(insideHum); Serial.println("%");
+}
