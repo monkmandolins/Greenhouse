@@ -1,0 +1,175 @@
+esphome:
+  name: greenhousecyd
+  friendly_name: GreenhouseCYD
+  on_boot:
+    priority: 600
+    then:
+      - script.execute: send_rp2040_outputs
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: "k5IHzbrRYkJYLrztyMcfjXQbAbN4s8dIrH4Xyn/jal8="
+
+ota:
+  - platform: esphome
+    password: "e1baad0d2b2bf6a0176bff9b75f26bf1"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Greenhousecyd Fallback Hotspot"
+    password: "f60OSbQUGRbT"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+i2c:
+  id: i2c_bus
+  sda: GPIO22
+  scl: GPIO27
+  frequency: 100kHz
+  scan: true
+
+i2c_device:
+  id: rp2040_slave_device
+  address: 0x42
+
+globals:
+  - id: g_temp_f
+    type: float
+    initial_value: "0.0"
+  - id: g_humidity
+    type: float
+    initial_value: "0.0"
+  - id: g_led_grow_lights_state
+    type: bool
+    initial_value: "false"
+  - id: g_mist_humidity_state
+    type: bool
+    initial_value: "false"
+  - id: g_fan_speed_value
+    type: float
+    initial_value: "0.0"
+  - id: g_heater_duty_value
+    type: float
+    initial_value: "0.0"
+
+interval:
+  - interval: 5s
+    then:
+      - script.execute: read_rp2040_sensor_data
+
+script:
+  - id: read_rp2040_sensor_data
+    then:
+      - lambda: |-
+          uint8_t data[8];
+          if (!id(rp2040_slave_device).read_bytes(0x00, data, 8)) {
+            ESP_LOGW("rp2040", "Failed to read I2C sensor data.");
+            return;
+          }
+          float temp, hum;
+          memcpy(&temp, &data[0], 4);
+          memcpy(&hum, &data[4], 4);
+          id(g_temp_f) = temp;
+          id(g_humidity) = hum;
+  - id: send_rp2040_outputs
+    then:
+      - lambda: |-
+          uint8_t output_data[4];
+          output_data[0] = id(g_led_grow_lights_state) ? 1 : 0;
+          output_data[1] = id(g_mist_humidity_state) ? 1 : 0;
+          output_data[2] = static_cast<uint8_t>(id(g_fan_speed_value) * 255);
+          output_data[3] = static_cast<uint8_t>(id(g_heater_duty_value) * 255);
+
+          if (!id(rp2040_slave_device).write_bytes(0x00, output_data, 4)) {
+            ESP_LOGE("rp2040", "Failed to write output data to RP2040.");
+          } else {
+            ESP_LOGD("rp2040", "Sent output commands to RP2040.");
+          }
+
+sensor:
+  - platform: template
+    name: "Greenhouse Temperature"
+    id: greenhouse_temperature
+    lambda: |-
+      return id(g_temp_f);
+    unit_of_measurement: "°F"
+    icon: "mdi:thermometer"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+
+  - platform: template
+    name: "Greenhouse Humidity"
+    id: greenhouse_humidity
+    lambda: |-
+      return id(g_humidity);
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    accuracy_decimals: 1
+    device_class: humidity
+    state_class: measurement
+
+switch:
+  - platform: template
+    name: "Greenhouse Grow Light"
+    id: greenhouse_grow_light_entity
+    turn_on_action:
+      - lambda: |-
+          id(g_led_grow_lights_state) = true;
+          id(send_rp2040_outputs).execute();
+    turn_off_action:
+      - lambda: |-
+          id(g_led_grow_lights_state) = false;
+          id(send_rp2040_outputs).execute();
+
+  - platform: template
+    name: "Greenhouse Mist Humidifier"
+    id: greenhouse_mist_entity
+    turn_on_action:
+      - lambda: |-
+          id(g_mist_humidity_state) = true;
+          id(send_rp2040_outputs).execute();
+    turn_off_action:
+      - lambda: |-
+          id(g_mist_humidity_state) = false;
+          id(send_rp2040_outputs).execute();
+
+number:
+  - platform: template
+    name: "Greenhouse Fan Speed"
+    id: greenhouse_fan_speed_number
+    min_value: 0
+    max_value: 100
+    step: 1
+    mode: slider
+    set_action:
+      - lambda: |-
+          id(g_fan_speed_value) = x / 100.0;
+          id(send_rp2040_outputs).execute();
+
+  - platform: template
+    name: "Greenhouse Heater Duty"
+    id: greenhouse_heater_duty_number
+    min_value: 0
+    max_value: 100
+    step: 1
+    mode: slider
+    set_action:
+      - lambda: |-
+          id(g_heater_duty_value) = x / 100.0;
+          id(send_rp2040_outputs).execute();
+
+# Note: No 'climate' or LVGL/display sections included.
