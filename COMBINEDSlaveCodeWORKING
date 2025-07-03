@@ -1,0 +1,221 @@
+#include <Wire.h>    // For I2C communication (Wire1 for custom pins)
+#include <DHT.h>
+#include <DHT_U.h>   // Required for Adafruit DHT library
+
+// --- I2C Slave Configuration ---
+#define I2C_SLAVE_ADDRESS 0x42 // Must match ESPHome master address (e.g., on ESP32 CYD)
+
+// --- FINAL PIN DEFINITIONS for RP2040 GPIO ---
+// These are based on your provided specific wiring.
+
+// I2C Bus Pins for RP2040 (connecting to ESPCheapYellowDisplay pins 22 and 27)
+// RP2040 GPIO2 (SDA) -> ESP32 Pin 22 (or appropriate SDA on master)
+// RP2040 GPIO3 (SCL) -> ESP32 Pin 27 (or appropriate SCL on master)
+#define I2C_SDA_PIN 2          // GPIO2 for I2C SDA
+#define I2C_SCL_PIN 3          // GPIO3 for I2C SCL
+
+// DHT22 Sensor (only one remaining: in the greenhouse)
+#define DHT_GREENHOUSE_PIN  6  // GPIO6 for DHT22 inside the greenhouse
+
+// Digital Outputs (On/Off)
+#define LED_GROW_LIGHTS_PIN 8  // GPIO8 for LED Grow Lights Digital Output
+#define MIST_HUMIDITY_PIN   7  // GPIO7 for Atomizer/Humidifier Digital Output
+
+// PWM Outputs (Analog/Variable Control)
+#define FAN_PWM_PIN         14 // GPIO14 for Fan PWM Control
+#define HEATER_PWM_PIN      1  // GPIO1 for Heater PWM Control
+
+
+// --- DHT Sensor Type ---
+#define DHT_TYPE DHT22 // Define the type of DHT sensor being used (DHT11, DHT22, etc.)
+
+// --- DHT Sensor Object (only one) ---
+DHT_Unified dhtGreenhouse(DHT_GREENHOUSE_PIN, DHT_TYPE);
+
+// --- Global Variables for Sensor Readings (volatile for ISR access) ---
+// These variables store the latest sensor data and are updated in the loop.
+// Only greenhouse readings remain.
+volatile float greenhouseTemperature_F = 0.0; // Changed to Fahrenheit
+volatile float greenhouseHumidity = 0.0;
+
+// --- Global Variables for Output States (volatile for ISR access) ---
+// These variables are controlled by the master via I2C.
+volatile bool ledGrowLightsState = false; // true = ON, false = OFF
+volatile bool mistHumidityState = false;  // true = ON, false = OFF
+volatile uint8_t fanSpeedDuty = 0;        // 0-255 (received from master)
+volatile uint8_t heaterDuty = 0;          // 0-255 (received from master)
+
+// --- PWM Configuration ---
+// RP2040 PWM supports 16-bit resolution (0-65535).
+// The master sends 8-bit values (0-255), so we'll map them.
+const int PWM_BITS = 16;
+const uint16_t PWM_MAX_VALUE = (1 << PWM_BITS) - 1; // 65535 for 16-bit
+
+// --- Function Prototypes ---
+void requestEvent();
+void receiveEvent(int howMany);
+void readDHTSensor(); // Renamed to reflect single sensor
+void applyOutputStates();
+
+void setup() {
+    Serial.begin(115200);
+    Serial.println("--- RP2040 I2C Slave Greenhouse Controller ---");
+
+    // --- Initialize I2C Slave on custom pins ---
+    Wire1.setSDA(I2C_SDA_PIN);
+    Wire1.setSCL(I2C_SCL_PIN);
+    Wire1.begin(I2C_SLAVE_ADDRESS);
+    Wire1.onRequest(requestEvent);   // Register callback for master data requests
+    Wire1.onReceive(receiveEvent);   // Register callback for data received from master
+
+    Serial.print("I2C Slave Address: 0x");
+    Serial.println(I2C_SLAVE_ADDRESS, HEX);
+    Serial.print("I2C SDA Pin: GP"); Serial.println(I2C_SDA_PIN);
+    Serial.print("I2C SCL Pin: GP"); Serial.println(I2C_SCL_PIN);
+
+    // --- Initialize DHT Sensor ---
+    dhtGreenhouse.begin();
+    Serial.println("Greenhouse DHT22 sensor initialized.");
+
+    // Print sensor details to confirm (useful for debugging)
+    sensor_t sensor;
+
+    Serial.println("--- Greenhouse DHT Sensor Info ---");
+    dhtGreenhouse.temperature().getSensor(&sensor); // Get sensor details from the temperature sub-sensor
+    Serial.print("Sensor Type: "); Serial.println(sensor.name);
+    Serial.print("Driver Ver: "); Serial.println(sensor.version);
+    Serial.print("Unique ID: "); Serial.println(sensor.sensor_id);
+    Serial.print("Max Value: "); Serial.print(sensor.max_value); Serial.println(" C"); // DHT info is always in C
+    Serial.print("Min Value: "); Serial.print(sensor.min_value); Serial.println(" C"); // DHT info is always in C
+    Serial.print("Resolution: "); Serial.print(sensor.resolution); Serial.println(" C"); // DHT info is always in C
+
+
+    // --- Configure Output Pins ---
+    pinMode(LED_GROW_LIGHTS_PIN, OUTPUT);
+    pinMode(MIST_HUMIDITY_PIN, OUTPUT);
+    pinMode(FAN_PWM_PIN, OUTPUT);
+    pinMode(HEATER_PWM_PIN, OUTPUT);
+
+    // Set PWM resolution for RP2040. This affects subsequent analogWrite calls.
+    analogWriteResolution(PWM_BITS);
+
+    // Set initial states for all outputs to OFF/0
+    digitalWrite(LED_GROW_LIGHTS_PIN, LOW);
+    digitalWrite(MIST_HUMIDITY_PIN, LOW);
+    analogWrite(FAN_PWM_PIN, 0);
+    analogWrite(HEATER_PWM_PIN, 0);
+
+    // Perform an initial sensor reading to populate global variables
+    readDHTSensor(); // Call the updated single-sensor read function
+}
+
+void loop() {
+    // Periodically read DHT sensor and update global variables.
+    readDHTSensor(); // Call the updated single-sensor read function
+
+    // I2C communication is interrupt-driven and handled in requestEvent/receiveEvent.
+    delay(2000); // Read sensor every 2 seconds
+}
+
+// --- I2C Callback Functions ---
+
+/**
+ * @brief Handles data requests from the I2C master.
+ * The master requests sensor data from this slave.
+ * Now sends 2 floats (greenhouse temp in F, greenhouse hum).
+ */
+void requestEvent() {
+    // Prepare a buffer to send sensor data (2 floats = 8 bytes).
+    float dataToSend[2];
+    dataToSend[0] = greenhouseTemperature_F; // Send Fahrenheit
+    dataToSend[1] = greenhouseHumidity;
+
+    // Write the float array directly to the I2C buffer.
+    Wire1.write((byte*)dataToSend, sizeof(dataToSend)); // sizeof(dataToSend) will be 8 bytes
+
+    Serial.println("Sent greenhouse sensor data to master.");
+}
+
+/**
+ * @brief Handles data received from the I2C master.
+ * The master sends control commands to this slave.
+ * Expected data format: [LED_STATE, MIST_STATE, FAN_DUTY, HEATER_DUTY] (4 bytes)
+ * (This part of the communication protocol remains unchanged by sensor removal)
+ */
+void receiveEvent(int howMany) {
+    if (howMany == 4) { // Expecting exactly 4 bytes for control commands
+        uint8_t receivedData[4];
+        for (int i = 0; i < howMany; i++) {
+            receivedData[i] = Wire1.read();
+        }
+
+        // Update global volatile variables based on received data
+        ledGrowLightsState = (receivedData[0] != 0); // Non-zero for ON, 0 for OFF
+        mistHumidityState = (receivedData[1] != 0);  // Non-zero for ON, 0 for OFF
+        fanSpeedDuty = receivedData[2];              // 0-255 duty cycle
+        heaterDuty = receivedData[3];                // 0-255 duty cycle
+
+        // Apply the updated states to the physical pins immediately
+        applyOutputStates();
+
+        Serial.print("Received commands: LED="); Serial.print(ledGrowLightsState ? "ON" : "OFF");
+        Serial.print(", Mist="); Serial.print(mistHumidityState ? "ON" : "OFF");
+        Serial.print(", Fan="); Serial.print(fanSpeedDuty);
+        Serial.print(", Heater="); Serial.println(heaterDuty);
+    } else {
+        // If unexpected data length, read and discard remaining bytes to clear buffer
+        while (Wire1.available()) {
+            Wire1.read();
+        }
+        Serial.print("Received unexpected data length: ");
+        Serial.println(howMany);
+    }
+}
+
+// --- Helper Functions ---
+
+/**
+ * @brief Reads temperature and humidity from the greenhouse DHT sensor.
+ * Updates the global volatile variables with the latest readings.
+ * Includes error checking for sensor readings.
+ */
+void readDHTSensor() { // Renamed function
+    sensors_event_t event;
+    float tempC; // Temporary variable for Celsius reading
+
+    // Read greenhouse sensor temperature in Celsius first
+    dhtGreenhouse.temperature().getEvent(&event);
+    if (isnan(event.temperature)) {
+        Serial.println("Error reading greenhouse temperature!");
+    } else {
+        tempC = event.temperature;
+        greenhouseTemperature_F = (tempC * 1.8) + 32; // Convert Celsius to Fahrenheit
+    }
+
+    // Read greenhouse sensor humidity
+    dhtGreenhouse.humidity().getEvent(&event);
+    if (isnan(event.relative_humidity)) {
+        Serial.println("Error reading greenhouse humidity!");
+    } else {
+        greenhouseHumidity = event.relative_humidity;
+    }
+
+    Serial.print("Greenhouse: Temp="); Serial.print(greenhouseTemperature_F); Serial.print("F, Hum="); Serial.print(greenhouseHumidity); Serial.println("%");
+}
+
+/**
+ * @brief Applies the current global output states to the physical pins.
+ * This function is called when new commands are received via I2C.
+ */
+void applyOutputStates() {
+    // Digital outputs
+    digitalWrite(LED_GROW_LIGHTS_PIN, ledGrowLightsState ? HIGH : LOW);
+    digitalWrite(MIST_HUMIDITY_PIN, mistHumidityState ? HIGH : LOW);
+
+    // PWM outputs: Map 8-bit master values (0-255) to 16-bit RP2040 PWM (0-65535)
+    uint16_t fanDuty16 = map(fanSpeedDuty, 0, 255, 0, PWM_MAX_VALUE);
+    uint16_t heaterDuty16 = map(heaterDuty, 0, 255, 0, PWM_MAX_VALUE);
+
+    analogWrite(FAN_PWM_PIN, fanDuty16);
+    analogWrite(HEATER_PWM_PIN, heaterDuty16);
+}
