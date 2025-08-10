@@ -1,0 +1,147 @@
+#include <Wire.h>
+#include <DHT.h>
+#include <DHT_U.h>
+
+// ---------- I2C ----------
+#define I2C_SLAVE_ADDRESS 0x42
+#define I2C_SDA_PIN 2   // GP2
+#define I2C_SCL_PIN 3   // GP3
+
+// ---------- DHT22 ----------
+#define DHT_GREENHOUSE_PIN 6
+#define DHT_TYPE DHT22
+DHT_Unified dhtGreenhouse(DHT_GREENHOUSE_PIN, DHT_TYPE);
+
+// ---------- Outputs (no heater) ----------
+#define LED_GROW_LIGHTS_PIN 8
+#define MIST_HUMIDITY_PIN   7
+#define FAN_PWM_PIN         14
+
+// ---------- Globals ----------
+volatile float greenhouseTemperature_F = 0.0f;
+volatile float greenhouseHumidity      = 0.0f;
+
+volatile bool    ledGrowLightsState = false;
+volatile bool    mistHumidityState  = false;
+volatile uint8_t fanSpeedDuty       = 0;     // 0-255
+
+volatile uint8_t i2c_reg = 0x00;            // register pointer
+
+const int      PWM_BITS      = 16;
+const uint16_t PWM_MAX_VALUE = (1u << PWM_BITS) - 1u;
+
+// ---------- Prototypes ----------
+void requestEvent();
+void receiveEvent(int howMany);
+void readDHTSensor();
+void applyOutputStates();
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("--- RP2040 I2C Slave (No Heater) ---");
+
+  Wire1.setSDA(I2C_SDA_PIN);
+  Wire1.setSCL(I2C_SCL_PIN);
+  Wire1.begin(I2C_SLAVE_ADDRESS);
+  Wire1.onRequest(requestEvent);
+  Wire1.onReceive(receiveEvent);
+
+  dhtGreenhouse.begin();
+
+  pinMode(LED_GROW_LIGHTS_PIN, OUTPUT);
+  pinMode(MIST_HUMIDITY_PIN,   OUTPUT);
+  pinMode(FAN_PWM_PIN,         OUTPUT);
+
+  analogWriteResolution(PWM_BITS);
+
+  digitalWrite(LED_GROW_LIGHTS_PIN, LOW);
+  digitalWrite(MIST_HUMIDITY_PIN,   LOW);
+  analogWrite(FAN_PWM_PIN,          0);
+
+  readDHTSensor();
+}
+
+void loop() {
+  readDHTSensor();
+  delay(2000);
+}
+
+// ---------- I2C ----------
+/*
+ * Master read: read_bytes(0x00, buf, 8)
+ * We send two floats: [temp_F, humidity]
+ */
+void requestEvent() {
+  float payload[2] = { greenhouseTemperature_F, greenhouseHumidity };
+  Wire1.write((uint8_t*)payload, sizeof(payload));
+}
+
+/*
+ * Master write: write_bytes(0x00, 3)
+ * Bytes: [reg=0x00, LED, MIST, FAN]
+ * We also accept 3 bytes without reg (legacy raw).
+ * If 4+ arrive, we use first 3 after optional reg and ignore extras.
+ */
+void receiveEvent(int howMany) {
+  if (howMany <= 0) return;
+
+  uint8_t buf[16];
+  int i = 0;
+  while (Wire1.available() && i < (int)sizeof(buf)) {
+    buf[i++] = Wire1.read();
+  }
+
+  if (i == 1) {         // register select only
+    i2c_reg = buf[0];
+    return;
+  }
+
+  int off = (i >= 4) ? 1 : 0;  // if a reg byte is present, skip it
+  if ((i - off) >= 3) {
+    ledGrowLightsState = (buf[off + 0] != 0);
+    mistHumidityState  = (buf[off + 1] != 0);
+    fanSpeedDuty       =  buf[off + 2];
+    applyOutputStates();
+
+    Serial.print("I2C cmds -> LED:");
+    Serial.print(ledGrowLightsState ? "ON" : "OFF");
+    Serial.print(" Mist:");
+    Serial.print(mistHumidityState ? "ON" : "OFF");
+    Serial.print(" Fan:");
+    Serial.println(fanSpeedDuty);
+  } else {
+    Serial.print("I2C unexpected length: ");
+    Serial.println(i);
+  }
+}
+
+// ---------- Helpers ----------
+void readDHTSensor() {
+  sensors_event_t event;
+
+  dhtGreenhouse.temperature().getEvent(&event);
+  if (!isnan(event.temperature)) {
+    greenhouseTemperature_F = event.temperature * 1.8f + 32.0f;
+  } else {
+    Serial.println("Error reading greenhouse temperature");
+  }
+
+  dhtGreenhouse.humidity().getEvent(&event);
+  if (!isnan(event.relative_humidity)) {
+    greenhouseHumidity = event.relative_humidity;
+  } else {
+    Serial.println("Error reading greenhouse humidity");
+  }
+
+  Serial.print("Greenhouse: ");
+  Serial.print(greenhouseTemperature_F); Serial.print("F  ");
+  Serial.print(greenhouseHumidity);      Serial.println("%");
+}
+
+void applyOutputStates() {
+  digitalWrite(LED_GROW_LIGHTS_PIN, ledGrowLightsState ? HIGH : LOW);
+  digitalWrite(MIST_HUMIDITY_PIN,   mistHumidityState  ? HIGH : LOW);
+
+  uint16_t fanDuty16 = map(fanSpeedDuty, 0, 255, 0, PWM_MAX_VALUE);
+  analogWrite(FAN_PWM_PIN, fanDuty16);
+}
