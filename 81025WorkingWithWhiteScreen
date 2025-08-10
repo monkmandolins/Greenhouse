@@ -1,0 +1,340 @@
+esphome:
+  name: greenhousecyd
+  friendly_name: GreenhouseCYD
+  on_boot:
+    priority: 600
+    then:
+      - script.execute: send_rp2040_outputs
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+
+api:
+  encryption:
+    key: "k5IHzbrRYkJYLrztyMcfjXQbAbN4s8dIrH4Xyn/jal8="
+
+ota:
+  - platform: esphome
+    password: "e1baad0d2b2bf6a0176bff9b75f26bf1"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Greenhousecyd Fallback Hotspot"
+    password: "f60OSbQUGRbT"
+
+captive_portal:
+
+web_server:
+  port: 80
+
+# ---------- SPI for TFT + Touch (CYD defaults) ----------
+spi:
+  id: spi_bus
+  clk_pin: GPIO14
+  mosi_pin: GPIO13
+  miso_pin: GPIO12
+
+# ---------- TFT Display (ILI9341 on CYD) ----------
+display:
+  - platform: ili9xxx
+    id: lcd
+    model: ili9341
+    spi_id: spi_bus
+    cs_pin: GPIO15      # strap pin on CYD; OK (don’t add external pull resistors)
+    dc_pin: GPIO2       # strap pin on CYD; OK
+    reset_pin: GPIO4    # strap pin on CYD; OK
+    rotation: 90        # adjust if needed (0/90/180/270)
+    invert_colors: false
+    auto_clear_enabled: false
+    update_interval: never   # LVGL drives updates
+
+# ---------- Touch (XPT2046 sharing SPI) ----------
+touchscreen:
+  - platform: xpt2046
+    id: ts
+    spi_id: spi_bus
+    cs_pin: GPIO33
+    interrupt_pin: GPIO36
+    update_interval: 20ms
+    display: lcd
+    calibration:
+      x_min: 200
+      x_max: 3850
+      y_min: 200
+      y_max: 3850
+    transform:
+      swap_xy: true
+      # invert_x: false
+      # invert_y: false
+
+# ---------- Backlight control (separate from display component) ----------
+output:
+  - platform: gpio
+    id: lcd_backlight_output
+    pin:
+      number: GPIO21
+      inverted: false
+
+# ---------- Fonts ----------
+font:
+  - file: "gfonts://Inter"
+    id: font_large
+    size: 34
+  - file: "gfonts://Inter"
+    id: font_medium
+    size: 22
+  - file: "gfonts://Inter"
+    id: font_small
+    size: 16
+
+# ---------- LVGL UI ----------
+lvgl:
+  pages:
+    - id: dashboard_page     # avoid 'main' to prevent symbol collision
+      widgets:
+        - label:
+            id: title_lbl
+            text: "Greenhouse"
+            align: TOP_MID
+            y: 6
+            text_font: font_medium
+
+        - label:
+            id: temp_lbl
+            text: !lambda |-
+              return esphome::str_sprintf("Temp: %.1f°F", id(greenhouse_temperature).state);
+            x: 10
+            y: 40
+            align: TOP_LEFT
+            text_font: font_large
+
+        - label:
+            id: hum_lbl
+            text: !lambda |-
+              return esphome::str_sprintf("Hum: %.1f%%", id(greenhouse_humidity).state);
+            x: 10
+            y: 90
+            align: TOP_LEFT
+            text_font: font_large
+
+        # Lights button
+        - button:
+            id: lights_btn
+            x: 10
+            y: 150
+            width: 140
+            height: 60
+            checkable: true
+            state:
+              checked: !lambda |-
+                return id(greenhouse_grow_light_entity).state;
+            on_click:
+              then:
+                - if:
+                    condition:
+                      switch.is_on: greenhouse_grow_light_entity
+                    then:
+                      - switch.turn_off: greenhouse_grow_light_entity
+                    else:
+                      - switch.turn_on: greenhouse_grow_light_entity
+            widgets:
+              - label:
+                  text: !lambda |-
+                    return std::string(id(greenhouse_grow_light_entity).state ? "Lights: ON" : "Lights: OFF");
+                  text_font: font_medium
+
+        # Mister button
+        - button:
+            id: mist_btn
+            x: 170
+            y: 150
+            width: 140
+            height: 60
+            checkable: true
+            state:
+              checked: !lambda |-
+                return id(greenhouse_mist_entity).state;
+            on_click:
+              then:
+                - if:
+                    condition:
+                      switch.is_on: greenhouse_mist_entity
+                    then:
+                      - switch.turn_off: greenhouse_mist_entity
+                    else:
+                      - switch.turn_on: greenhouse_mist_entity
+            widgets:
+              - label:
+                  text: !lambda |-
+                    return std::string(id(greenhouse_mist_entity).state ? "Mister: ON" : "Mister: OFF");
+                  text_font: font_medium
+
+        # Fan slider + % readout
+        - slider:
+            id: fan_slider
+            x: 10
+            y: 220
+            width: 230
+            min_value: 0
+            max_value: 100
+            value: !lambda |-
+              return (int)(id(g_fan_speed_value) * 100.0f);
+            on_value:
+              then:
+                - lambda: |-
+                    id(g_fan_speed_value) = (float)x / 100.0f;
+                    id(send_rp2040_outputs).execute();
+
+        - label:
+            id: fan_val_lbl
+            text: !lambda |-
+              return esphome::str_sprintf("Fan: %d%%", (int)(id(g_fan_speed_value) * 100.0f));
+            x: 250
+            y: 220
+            text_font: font_medium
+
+# ---------- I²C to RP2040 ----------
+i2c:
+  id: i2c_bus
+  sda: GPIO22
+  scl: GPIO27
+  frequency: 100kHz
+  scan: true
+
+i2c_device:
+  id: rp2040_slave_device
+  address: 0x42
+
+# ---------- App State (no heater) ----------
+globals:
+  - id: g_temp_f
+    type: float
+    initial_value: "0.0"
+  - id: g_humidity
+    type: float
+    initial_value: "0.0"
+  - id: g_led_grow_lights_state
+    type: bool
+    initial_value: "false"
+  - id: g_mist_humidity_state
+    type: bool
+    initial_value: "false"
+  - id: g_fan_speed_value
+    type: float
+    initial_value: "0.0"
+
+interval:
+  - interval: 5s
+    then:
+      - script.execute: read_rp2040_sensor_data
+
+# ---------- Scripts to talk to RP2040 ----------
+script:
+  - id: read_rp2040_sensor_data
+    then:
+      - lambda: |-
+          uint8_t data[8];
+          if (!id(rp2040_slave_device).read_bytes(0x00, data, 8)) {
+            ESP_LOGW("rp2040", "Failed to read I2C sensor data.");
+            return;
+          }
+          float temp, hum;
+          memcpy(&temp, &data[0], 4);
+          memcpy(&hum,  &data[4], 4);
+          id(g_temp_f)   = temp;
+          id(g_humidity) = hum;
+
+  - id: send_rp2040_outputs
+    then:
+      - lambda: |-
+          // 3-byte payload: [LED, MIST, FAN(0-255)]
+          uint8_t output_data[3];
+          output_data[0] = id(g_led_grow_lights_state) ? 1 : 0;
+          output_data[1] = id(g_mist_humidity_state) ? 1 : 0;
+          output_data[2] = static_cast<uint8_t>(id(g_fan_speed_value) * 255.0f);
+          if (!id(rp2040_slave_device).write_bytes(0x00, output_data, 3)) {
+            ESP_LOGE("rp2040", "Failed to write output data to RP2040.");
+          } else {
+            ESP_LOGD("rp2040", "Sent output commands to RP2040 (no heater).");
+          }
+
+# ---------- Entities exposed to HA (also used by LVGL) ----------
+sensor:
+  - platform: template
+    name: "Greenhouse Temperature"
+    id: greenhouse_temperature
+    lambda: |-
+      return id(g_temp_f);
+    unit_of_measurement: "°F"
+    icon: "mdi:thermometer"
+    accuracy_decimals: 1
+    device_class: temperature
+    state_class: measurement
+
+  - platform: template
+    name: "Greenhouse Humidity"
+    id: greenhouse_humidity
+    lambda: |-
+      return id(g_humidity);
+    unit_of_measurement: "%"
+    icon: "mdi:water-percent"
+    accuracy_decimals: 1
+    device_class: humidity
+    state_class: measurement
+
+switch:
+  - platform: output
+    id: lcd_backlight
+    name: "LCD Backlight"
+    output: lcd_backlight_output
+    restore_mode: ALWAYS_ON
+
+  - platform: template
+    name: "Greenhouse Grow Light"
+    id: greenhouse_grow_light_entity
+    turn_on_action:
+      - lambda: |-
+          id(g_led_grow_lights_state) = true;
+          id(send_rp2040_outputs).execute();
+    turn_off_action:
+      - lambda: |-
+          id(g_led_grow_lights_state) = false;
+          id(send_rp2040_outputs).execute();
+    lambda: |-
+      return id(g_led_grow_lights_state);
+
+  - platform: template
+    name: "Greenhouse Mist Humidifier"
+    id: greenhouse_mist_entity
+    turn_on_action:
+      - lambda: |-
+          id(g_mist_humidity_state) = true;
+          id(send_rp2040_outputs).execute();
+    turn_off_action:
+      - lambda: |-
+          id(g_mist_humidity_state) = false;
+          id(send_rp2040_outputs).execute();
+    lambda: |-
+      return id(g_mist_humidity_state);
+
+number:
+  - platform: template
+    name: "Greenhouse Fan Speed"
+    id: greenhouse_fan_speed_number
+    min_value: 0
+    max_value: 100
+    step: 1
+    mode: slider
+    set_action:
+      - lambda: |-
+          id(g_fan_speed_value) = x / 100.0f;
+          id(send_rp2040_outputs).execute();
+    lambda: |-
+      return id(g_fan_speed_value) * 100.0f;
