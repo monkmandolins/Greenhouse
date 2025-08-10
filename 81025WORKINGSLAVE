@@ -1,0 +1,209 @@
+#include <Wire.h>    // I2C
+#include <DHT.h>
+#include <DHT_U.h>   // Adafruit DHT unified
+
+// ---------------- I2C Slave Configuration ----------------
+#define I2C_SLAVE_ADDRESS 0x42   // must match ESPHome i2c_device address
+
+// ---------------- FINAL PIN DEFINITIONS (RP2040) ---------
+// I2C pins (to ESP32: SDA->GPIO22, SCL->GPIO27)
+#define I2C_SDA_PIN 2            // GP2 SDA
+#define I2C_SCL_PIN 3            // GP3 SCL
+
+// DHT22 Sensor (greenhouse)
+#define DHT_GREENHOUSE_PIN  6    // GP6
+
+// Digital Outputs
+#define LED_GROW_LIGHTS_PIN 8    // GP8
+#define MIST_HUMIDITY_PIN   7    // GP7
+
+// PWM Outputs
+#define FAN_PWM_PIN         14   // GP14
+#define HEATER_PWM_PIN      1    // GP1
+
+// DHT sensor type
+#define DHT_TYPE DHT22
+
+// ---------------- Objects ----------------
+DHT_Unified dhtGreenhouse(DHT_GREENHOUSE_PIN, DHT_TYPE);
+
+// ---------------- Globals ----------------
+// Sensor readings (updated in loop)
+volatile float greenhouseTemperature_F = 0.0f;
+volatile float greenhouseHumidity      = 0.0f;
+
+// Output states (set by master)
+volatile bool    ledGrowLightsState = false;
+volatile bool    mistHumidityState  = false;
+volatile uint8_t fanSpeedDuty       = 0;     // 0-255
+volatile uint8_t heaterDuty         = 0;     // 0-255
+
+// I2C "register pointer" to match ESPHome's read_bytes/write_bytes(reg,...)
+volatile uint8_t i2c_reg = 0x00;
+
+// PWM config
+const int      PWM_BITS       = 16;
+const uint16_t PWM_MAX_VALUE  = (1u << PWM_BITS) - 1u;  // 65535
+
+// ---------------- Prototypes ----------------
+void requestEvent();
+void receiveEvent(int howMany);
+void readDHTSensor();
+void applyOutputStates();
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("--- RP2040 I2C Slave Greenhouse Controller ---");
+
+  // I2C slave on custom pins using Wire1
+  Wire1.setSDA(I2C_SDA_PIN);
+  Wire1.setSCL(I2C_SCL_PIN);
+  Wire1.begin(I2C_SLAVE_ADDRESS);     // begin as SLAVE at 0x42
+  Wire1.onRequest(requestEvent);      // master is reading from us
+  Wire1.onReceive(receiveEvent);      // master wrote to us
+
+  Serial.print("I2C Slave Address: 0x"); Serial.println(I2C_SLAVE_ADDRESS, HEX);
+  Serial.print("I2C SDA Pin: GP"); Serial.println(I2C_SDA_PIN);
+  Serial.print("I2C SCL Pin: GP"); Serial.println(I2C_SCL_PIN);
+
+  // DHT init
+  dhtGreenhouse.begin();
+  Serial.println("Greenhouse DHT22 initialized.");
+
+  // Optional: print sensor info once
+  sensor_t sensor;
+  dhtGreenhouse.temperature().getSensor(&sensor);
+  Serial.print("DHT Temp Driver Ver: "); Serial.println(sensor.version);
+  dhtGreenhouse.humidity().getSensor(&sensor);
+  Serial.print("DHT Hum Driver Ver: "); Serial.println(sensor.version);
+
+  // Outputs
+  pinMode(LED_GROW_LIGHTS_PIN, OUTPUT);
+  pinMode(MIST_HUMIDITY_PIN,   OUTPUT);
+  pinMode(FAN_PWM_PIN,         OUTPUT);
+  pinMode(HEATER_PWM_PIN,      OUTPUT);
+
+  // Keep your existing resolution call (works on many cores)
+  analogWriteResolution(PWM_BITS);
+
+  // Initial states OFF
+  digitalWrite(LED_GROW_LIGHTS_PIN, LOW);
+  digitalWrite(MIST_HUMIDITY_PIN,   LOW);
+  analogWrite(FAN_PWM_PIN,          0);
+  analogWrite(HEATER_PWM_PIN,       0);
+
+  // First sensor read
+  readDHTSensor();
+}
+
+void loop() {
+  // Update DHT every ~2s
+  readDHTSensor();
+  delay(2000);
+}
+
+// ---------------- I2C Callbacks ----------------
+/*
+ * Master does: read_bytes(0x00, buf, 8)
+ * That sequence is: [write 0x00 as register] + [read 8 bytes]
+ * We simply return two floats (temperature_F, humidity)
+ */
+void requestEvent() {
+  // If you ever add multiple data pages, switch on i2c_reg here.
+  float payload[2];
+  payload[0] = greenhouseTemperature_F;
+  payload[1] = greenhouseHumidity;
+
+  Wire1.write((uint8_t*)payload, sizeof(payload));
+  // Avoid Serial in ISR path; uncomment for troubleshooting only:
+  // Serial.println("I2C: sent 2 floats to master");
+}
+
+/*
+ * Master does: write_bytes(0x00, 4 data bytes)
+ * That sequence arrives as 5 bytes: [reg=0x00, led, mist, fan, heater]
+ * We also accept legacy 4-byte payloads without the register.
+ * If exactly 1 byte arrives, treat it as "register select" prior to a read.
+ */
+void receiveEvent(int howMany) {
+  if (howMany <= 0) return;
+
+  uint8_t buf[16];
+  int i = 0;
+  while (Wire1.available() && i < (int)sizeof(buf)) {
+    buf[i++] = Wire1.read();
+  }
+
+  if (i == 1) {
+    // Register select (typical before a read)
+    i2c_reg = buf[0];
+    return;
+  }
+
+  int off = 0;
+  if (i >= 5) {
+    // Typical ESPHome path: first byte is register
+    off = 1;
+  }
+
+  if ((i - off) >= 4) {
+    ledGrowLightsState = (buf[off + 0] != 0);
+    mistHumidityState  = (buf[off + 1] != 0);
+    fanSpeedDuty       =  buf[off + 2];
+    heaterDuty         =  buf[off + 3];
+
+    applyOutputStates();
+
+    // Keep logs light here
+    Serial.print("I2C cmds -> LED:");
+    Serial.print(ledGrowLightsState ? "ON" : "OFF");
+    Serial.print(" Mist:");
+    Serial.print(mistHumidityState ? "ON" : "OFF");
+    Serial.print(" Fan:");
+    Serial.print(fanSpeedDuty);
+    Serial.print(" Heater:");
+    Serial.println(heaterDuty);
+  } else {
+    Serial.print("I2C unexpected length: ");
+    Serial.println(i);
+  }
+}
+
+// ---------------- Helpers ----------------
+void readDHTSensor() {
+  sensors_event_t event;
+
+  // Temperature (C -> F)
+  dhtGreenhouse.temperature().getEvent(&event);
+  if (!isnan(event.temperature)) {
+    float tempC = event.temperature;
+    greenhouseTemperature_F = tempC * 1.8f + 32.0f;
+  } else {
+    Serial.println("Error reading greenhouse temperature");
+  }
+
+  // Humidity
+  dhtGreenhouse.humidity().getEvent(&event);
+  if (!isnan(event.relative_humidity)) {
+    greenhouseHumidity = event.relative_humidity;
+  } else {
+    Serial.println("Error reading greenhouse humidity");
+  }
+
+  Serial.print("Greenhouse: ");
+  Serial.print(greenhouseTemperature_F); Serial.print("F  ");
+  Serial.print(greenhouseHumidity);      Serial.println("%");
+}
+
+void applyOutputStates() {
+  // Digital outputs
+  digitalWrite(LED_GROW_LIGHTS_PIN, ledGrowLightsState ? HIGH : LOW);
+  digitalWrite(MIST_HUMIDITY_PIN,   mistHumidityState  ? HIGH : LOW);
+
+  // Map 8-bit (0-255) -> 16-bit (0-65535)
+  uint16_t fanDuty16    = map(fanSpeedDuty,  0, 255, 0, PWM_MAX_VALUE);
+  uint16_t heaterDuty16 = map(heaterDuty,    0, 255, 0, PWM_MAX_VALUE);
+
+  analogWrite(FAN_PWM_PIN,    fanDuty16);
+  analogWrite(HEATER_PWM_PIN, heaterDuty16);
+}
